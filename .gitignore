@@ -1,0 +1,28 @@
+# dependencies
+node_modules/
+
+# logs / temp
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# local scratch
+_*
+
+# local agent/tooling scaffolding (not part of the plugin)
+.trellis/
+.agents/
+.dsh/
+AGENTS.md
+.gitattributes
+.tmp-*
+.diag*
+
+# machine-specific launcher, points at a local install layout
+restart-dsh-web.ps1

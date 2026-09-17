@@ -1,0 +1,5 @@
+# dsh-session-namer bundle: mount the Node half that summarizes the session and
+# writes the result as its explicit title.
+- insert:
+    - id: dsh-session-namer
+      name: 'dsh-session-namer'
