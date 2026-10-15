@@ -10,6 +10,10 @@ DSH Web 插件：会话标题右侧加一个「总结命名」按钮 —— 用*
   `GET /dsh-session-namer/name?jobId=…` 直到拿到标题；按钮上显示「总结中… / 已重命名：xxx / 失败：…」。
 - **宿主**（`lib/index.js`）：POST 只做参数与会话校验后**立刻返回 202 + jobId**，总结在后台跑，
   结果写进内存 job（保留 10 分钟，懒清理）。
+  - **信任围栏**：路由不在 `/api` 下，所以每个请求（POST 与 GET）都先过
+    `ctx.connection.requestRejection()`；被拒时用宿主给的状态码回包且不带 body。
+    这也是 `inject` 里必须声明 `connection` 的原因——没有这道闸，任何能到达该端口的
+    本地页面都能改名一个活会话。
   - 为什么分两步：总结要 1~5 秒，一次 POST 等到结果的话，响应会在回程被中间层切断
     （客户端报 `Response incomplete: length`）。分成"立刻返回 + 轮询"就没有这个窗口了。
   - 总结内容：读该会话的人类消息（规则与 `dsh-session-title` 一致），在字节预算内选取要送进模型的
@@ -50,7 +54,28 @@ pwsh -NoProfile -File install-session-namer.ps1 -Check
 pwsh -NoProfile -File install-session-namer.ps1 -Remove
 ```
 
+profile 会自动解析：`-Profile` 显式指定 > 已经装了本插件的 profile > 唯一的 profile；
+都确定不了就报错并列出候选，不再默认写死 `web`。本机只有一个 `desktop` profile：
+
+```powershell
+pwsh -NoProfile -File install-session-namer.ps1 -Profile desktop
+```
+
 安装后需要**重启 `dsh web`**（或重开 DSH 应用）才会加载。
+
+## 自检
+
+零依赖、不需要 profile、不需要运行中的宿主：
+
+```powershell
+node selftest-session-namer.mjs               # 纯逻辑 + 路由 + 围栏 + 浏览器 half
+node selftest-session-namer.mjs --installed   # 额外把构建产物与 profile 安装副本逐字节比对
+```
+
+`lib/index.js` 顶层 import 的 `@deepseek-ai/dsh-session-title-llm` 由宿主的 Loader 在运行时
+解析，普通 node 进程解析不到，所以自检用 `selftest/stub-framework.mjs` 挂了一个解析桩——
+桩只在自检里生效，不进入运行时。官方配置校验（`resolveSessionTitleLlmConfig`）在解析不到
+官方包时会 SKIP 而不是失败。
 
 ## 已知边界
 
@@ -62,5 +87,7 @@ pwsh -NoProfile -File install-session-namer.ps1 -Remove
 - 只处理**进程内活着**的会话：`ctx.sessions.get(id)` 拿不到就返回 404（历史会话先打开一次即可）。
 - 点了按钮会往会话日志追加官方同款事件（`session/title-llm-request` + `session/title`），
   不会打开新的对话轮次，也不进模型上下文。
-- 目录是**真实复制**进 profile 的 `node_modules`，不是软链：Node 按真实路径解析 `import`，
-  软链会让 `@deepseek-ai/*` 解析失败。以后在该 profile 跑 `pnpm install` 可能清掉它，重跑安装脚本即可。
+- 目录是**真实复制**进 profile 的 `node_modules`，不是软链：这样安装副本才能被
+  `selftest --installed` 逐字节比对，也避免 pnpm 的 link 语义在 profile 重装时改变解析路径。
+  以后在该 profile 跑 `pnpm install` 可能清掉它，重跑安装脚本即可。
+  （`@deepseek-ai/*` 由宿主 Loader 解析，与是否软链无关。）

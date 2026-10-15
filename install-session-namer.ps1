@@ -1,15 +1,22 @@
 # install-session-namer.ps1
-# 构建 dsh-session-namer 并挂载到 web profile：
+# 构建 dsh-session-namer 并挂载到一个 dsh profile：
 #   1) node build.mjs          —— 生成 lib/
-#   2) 复制进 ~/.dsh/profiles/web/node_modules/dsh-session-namer（真实目录，不是软链）
-#      注意：这里必须用真实目录。Node 会按真实路径解析 import，link: 过来的包会去
-#      C:\RJ\... 下面找 @deepseek-ai/* 而找不到；真实目录则在 profile 的 node_modules
-#      树里解析得到（dsh-better-sidebar 就是这个形态）。
+#   2) 复制进 <profile>/node_modules/dsh-session-namer（真实目录，不是软链）
+#      为什么用真实目录：安装副本才能被逐字节比对（selftest --installed），
+#      也避免 pnpm 的 link 语义在 profile 重装时改变解析路径。
+#      注：'@deepseek-ai/*' 由宿主 Loader 在运行时解析，与这里无关 —— 旧注释
+#      声称"必须真实目录才能解析到 @deepseek-ai/*"并不成立（desktop profile 的
+#      node_modules 里根本没有 @deepseek-ai，插件照常工作）。
 #   3) 把 dsh-session-namer 加进 profile package.json 的 dsh.profile.bundles
 # 之后需要重启 dsh web 才会加载。
-# 用法: pwsh -NoProfile -File install-session-namer.ps1 [-Check] [-Remove]
+#
+# profile 解析顺序：-Profile 显式指定 > 已经装了本插件的 profile > 唯一的 profile；
+# 都确定不了就报错并列出候选，不再默认写死 web。
+#
+# 用法: pwsh -NoProfile -File install-session-namer.ps1 [-Profile <名称>] [-Check] [-Remove]
 
 param(
+	[string]$Profile,
 	[switch]$Check,
 	[switch]$Remove
 )
@@ -17,12 +24,33 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $source = Split-Path -Parent $MyInvocation.MyCommand.Path
-$profileRoot = Join-Path $env:USERPROFILE '.dsh\profiles\web'
-$profilePkg = Join-Path $profileRoot 'package.json'
 $pluginName = 'dsh-session-namer'
-$targetDir = Join-Path $profileRoot "node_modules\$pluginName"
 
-if (-not (Test-Path -LiteralPath $profilePkg)) { throw "找不到 profile package.json: $profilePkg" }
+$dshHome = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $env:USERPROFILE '.dsh' }
+$profilesRoot = Join-Path $dshHome 'profiles'
+if (-not (Test-Path -LiteralPath $profilesRoot)) { throw "找不到 profiles 目录: $profilesRoot" }
+
+$candidates = @(Get-ChildItem -LiteralPath $profilesRoot -Directory |
+	Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'package.json') })
+if ($candidates.Count -eq 0) { throw "在 $profilesRoot 下没有找到任何 profile（缺少 package.json）" }
+
+if ($Profile) {
+	$profileRoot = Join-Path $profilesRoot $Profile
+	if (-not (Test-Path -LiteralPath (Join-Path $profileRoot 'package.json'))) {
+		throw "profile '$Profile' 不存在或缺少 package.json；候选: $($candidates.Name -join ', ')"
+	}
+} else {
+	$installed = @($candidates | Where-Object {
+		(Get-Content -LiteralPath (Join-Path $_.FullName 'package.json') -Raw | ConvertFrom-Json).dsh.profile.bundles -contains $pluginName
+	})
+	if ($installed.Count -ge 1) { $profileRoot = $installed[0].FullName }
+	elseif ($candidates.Count -eq 1) { $profileRoot = $candidates[0].FullName }
+	else { throw "无法确定 profile，请用 -Profile <名称>；候选: $($candidates.Name -join ', ')" }
+}
+
+$profilePkg = Join-Path $profileRoot 'package.json'
+$targetDir = Join-Path (Join-Path $profileRoot 'node_modules') $pluginName
+Write-Host "[info] profile: $profileRoot"
 
 # ---------------------------------------------------------------- 反安装
 if ($Remove) {
