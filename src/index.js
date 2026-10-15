@@ -1,6 +1,8 @@
 // dsh-session-namer Node half.
 //
-// 两个路由，都不在 /api 下面，所以客户端按钮不需要过 API 鉴权网关：
+// 两个路由都不在 /api 下面 —— 也就是说它们不经过宿主的 API 鉴权网关，
+// 所以必须自己对每个请求调用 ctx.connection.requestRejection()：有请求被拒时
+// 用宿主给的状态码回包（不带 body），否则任何能到达该端口的页面都能改名一个活会话。
 //   POST /dsh-session-namer/name {sessionId}  -> 202 {ok, jobId}（立刻返回）
 //   GET  /dsh-session-namer/name?jobId=...    -> {ok, status:"running"|"done", title?}
 //
@@ -14,7 +16,7 @@ import { generateSessionTitleWithLlm, resolveSessionTitleLlmConfig } from '@deep
 
 const name = 'dsh-session-namer'
 const ROUTE = '/dsh-session-namer/name'
-const inject = ['webServer', 'sessionTitle', 'llm', 'sessions']
+const inject = ['webServer', 'sessionTitle', 'llm', 'sessions', 'connection']
 
 /** 默认预算：够覆盖整段对话；标题刻意短，免得顶栏和侧栏被名字撑爆。 */
 const DEFAULTS = {
@@ -274,12 +276,22 @@ function apply(ctx, config) {
   /** jobId -> 结果槽。只活在进程内，结果也只给点按钮的那个客户端看。 */
   const jobs = new Map()
 
+  /** 拒绝不可信/未鉴权请求；返回 true 表示已经回过包，调用方直接返回。 */
+  const rejected = (req, res) => {
+    const rejection = ctx.connection.requestRejection(req)
+    if (rejection === undefined) return false
+    res.writeHead(rejection)
+    res.end()
+    return true
+  }
+
   ctx.effect(
     () =>
       ctx.webServer.register({
         kind: 'exact',
         path: ROUTE,
         async handler(req, res) {
+          if (rejected(req, res)) return
           const now = Date.now()
           for (const [id, job] of jobs) if (now - job.createdAt > JOB_TTL_MS) jobs.delete(id)
 
