@@ -1,30 +1,51 @@
-// dsh-session-namer 离线自检：
-// 1) 装到 profile 里的那份能不能解析框架 import（这是 link/复制最容易踩的坑）；
-// 2) 人类消息采集规则与字节预算裁剪的行为；
-// 3) 默认配置能过官方 session-title-llm 的校验（provider/model 必须成对出现等）。
-// 用法: node selftest-session-namer.mjs [lib/index.js 路径]
-import { createRequire } from 'node:module'
-import { readFileSync } from 'node:fs'
-import { pathToFileURL } from 'node:url'
+// dsh-session-namer 离线自检（零依赖、不需要 profile、不需要运行中的宿主）：
+// 1) 纯逻辑：人类消息采集、字节预算裁剪、标题收窄；
+// 2) 路由流程：POST 立刻发 jobId -> GET 轮询，含信任围栏；
+// 3) 浏览器 half：错误文案映射与顶栏宽度上限；
+// 4) --installed：把工作区构建产物与 profile 里的安装副本逐字节比对。
+//
+// 为什么不再 import 安装副本：lib/index.js 顶层 import
+// '@deepseek-ai/dsh-session-title-llm'，而那个包由宿主的 Loader 在运行时解析，
+// 普通 node 进程解析不到 —— 旧写法会在导入阶段就 exit(1)，下面的断言从来没有
+// 执行过。现在改为挂本地解析桩 + 直接导入工作区构建产物：测的就是要发布的东西。
+//
+// 用法:
+//   node selftest-session-namer.mjs                纯逻辑 + 路由（默认）
+//   node selftest-session-namer.mjs --installed    额外比对 profile 安装副本
+//   node selftest-session-namer.mjs <lib/index.js> 指定构建产物
+import { createRequire, register } from 'node:module'
+import { readFileSync, readdirSync, existsSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { homedir } from 'node:os'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
-const target =
-	process.argv[2] ??
-	`${process.env.USERPROFILE}\\.dsh\\profiles\\web\\node_modules\\dsh-session-namer\\lib\\index.js`
+const here = dirname(fileURLToPath(import.meta.url))
+const argv = process.argv.slice(2)
+const checkInstalled = argv.includes('--installed')
+const override = argv.find((arg) => arg.startsWith('--') === false)
+
+// 宿主的 Loader 才解析 @deepseek-ai/*；这里把该 specifier 指到本地桩，让导入图
+// 能走通（桩不参与任何运行时逻辑）。
+register('./selftest/stub-framework.mjs', import.meta.url)
+
+const target = override ?? join(here, 'lib', 'index.js')
 
 const fail = (message) => {
-	console.error(`[fail] ${message}`)
+	console.error('[fail] ' + message)
 	process.exit(1)
 }
+const skip = (message) => console.log('[skip] ' + message)
 
-// ---- 1) 导入安装副本（顺带验证框架 import 能解析）
+// ---- 1) 导入工作区构建产物
 let module
 try {
 	module = await import(pathToFileURL(target).href)
 } catch (error) {
-	fail(`导入失败（框架 import 解析不了？）：${String(error?.message ?? error)}`)
+	fail('导入 ' + target + ' 失败：' + String(error?.message ?? error))
 }
 if (typeof module.apply !== 'function') fail('缺少 apply 导出')
 if (!Array.isArray(module.inject) || module.inject.includes('webServer') === false) fail('缺少 webServer 注入')
+if (!module.inject.includes('connection')) fail('inject 必须声明 connection（路由自带信任围栏）')
 const { humanMessageOf, humanMessagesOf, fitMessages, DEFAULTS, ROUTE } = module.__test ?? {}
 if (humanMessageOf === undefined) fail('缺少 __test 导出')
 
@@ -90,28 +111,34 @@ if (cjkFitted.length === 0) fail('中文会话裁剪后不应为空')
 if (cjkBytes > budget) fail(`中文消息按字节算仍超预算: ${cjkBytes} > ${budget}（说明还在按码元计）`)
 if (cjkFitted.length >= cjk.length) fail('1000 汉字 × 30 条必须被裁剪，不能整段放行')
 
-// ---- 4) 默认配置过官方校验（从安装副本解析官方包，顺带再验一次解析链）
-if (ROUTE !== '/dsh-session-namer/name') fail(`路由不符: ${ROUTE}`)
-const requireFromInstalled = createRequire(target)
-let resolveSessionTitleLlmConfig
-try {
-	const resolved = requireFromInstalled.resolve('@deepseek-ai/dsh-session-title-llm')
-	;({ resolveSessionTitleLlmConfig } = await import(pathToFileURL(resolved).href))
-} catch (error) {
-	fail(`解析官方 session-title-llm 失败：${String(error?.message ?? error)}`)
+// ---- 4) 默认配置过官方校验（仅当本进程能解析到官方包时才跑）
+if (ROUTE !== '/dsh-session-namer/name') fail('路由不符: ' + ROUTE)
+let officialEntry = null
+for (const base of [target, join(here, 'package.json')]) {
+	try {
+		officialEntry = createRequire(base).resolve('@deepseek-ai/dsh-session-title-llm')
+		break
+	} catch {
+		officialEntry = null
+	}
 }
-try {
-	resolveSessionTitleLlmConfig({ ...DEFAULTS })
-} catch (error) {
-	fail(`默认配置没通过官方校验: ${String(error?.message ?? error)}`)
+if (officialEntry === null) {
+	skip('本进程解析不到 @deepseek-ai/dsh-session-title-llm（由宿主在运行时解析），跳过官方配置校验')
+} else {
+	const { resolveSessionTitleLlmConfig } = await import(pathToFileURL(officialEntry).href)
+	try {
+		resolveSessionTitleLlmConfig({ ...DEFAULTS })
+	} catch (error) {
+		fail('默认配置没通过官方校验: ' + String(error?.message ?? error))
+	}
+	let paired = false
+	try {
+		resolveSessionTitleLlmConfig({ ...DEFAULTS, provider: 'dy' })
+	} catch {
+		paired = true
+	}
+	if (!paired) fail('只给 provider 不给 model 时官方校验应当报错')
 }
-let paired = false
-try {
-	resolveSessionTitleLlmConfig({ ...DEFAULTS, provider: 'dy' })
-} catch {
-	paired = true
-}
-if (!paired) fail('只给 provider 不给 model 时官方校验应当报错')
 
 // ---- 5) 标题收窄（显示宽度：CJK 记 2）
 const { shortTitle, TITLE_MAX_WIDTH, DEFAULTS: DEFAULTS_REF } = module.__test
@@ -149,6 +176,7 @@ const session = {
 	requestHeader: () => undefined,
 }
 const fakeCtx = {
+	connection: { requestRejection: () => undefined },
 	effect: (fn) => {
 		fn()
 		return () => {}
@@ -240,8 +268,54 @@ if (imageOnlyCall.status !== 409) fail(`纯图片会话应 409，实际 ${imageO
 if (imageOnlyCall.json.code !== 'no-human-message') fail(`409 应带 code=no-human-message，实际 ${JSON.stringify(imageOnlyCall.json)}`)
 if (String(imageOnlyCall.json.error).length > 12) fail(`409 文案太长，会撑爆顶栏 pill: ${imageOnlyCall.json.error}`)
 
+// ---- 6b) 信任围栏：路由不在 /api 下，必须自己对每个请求过闸
+let fencedHandler = null
+let fenceCalls = 0
+const fencedCtx = {
+	...fakeCtx,
+	connection: { requestRejection: () => { fenceCalls += 1; return 401 } },
+	webServer: { register: (route) => { fencedHandler = route.handler; return () => {} } },
+	sessions: { get: () => { throw new Error('围栏拒绝时不应查询会话') } },
+}
+module.apply(fencedCtx)
+if (fencedHandler === null) fail('apply 没有注册路由（围栏用例）')
+
+const callFenced = (method, url, body) =>
+	new Promise((resolve, reject) => {
+		const req = {
+			method,
+			url,
+			headers: {},
+			on(event, callback) {
+				if (event === 'data' && body !== undefined) callback(Buffer.from(body))
+				if (event === 'end') callback()
+				return req
+			},
+			destroy() {},
+		}
+		const res = {
+			statusCode: 0,
+			body: undefined,
+			writeHead(status) {
+				this.statusCode = status
+				return this
+			},
+			end(chunk) {
+				this.body = chunk
+				resolve({ status: this.statusCode, body: this.body })
+			},
+		}
+		Promise.resolve(fencedHandler(req, res)).catch(reject)
+	})
+
+const fencedGet = await callFenced('GET', ROUTE)
+if (fencedGet.status !== 401) fail('GET 未过围栏时应返回 401，实际 ' + fencedGet.status)
+if (fencedGet.body !== undefined) fail('围栏拒绝时不应带响应体')
+const fencedPost = await callFenced('POST', ROUTE, JSON.stringify({ sessionId: 'live' }))
+if (fencedPost.status !== 401) fail('POST 未过围栏时应返回 401，实际 ' + fencedPost.status)
+if (fenceCalls < 2) fail('GET 与 POST 都必须经过围栏，实际调用 ' + fenceCalls + ' 次')
 // ---- 7) client half：错误文案映射与顶栏宽度上限（假 DOM + 假 react）
-const clientPath = target.replace(/lib[\\/]index\.js$/, 'lib\\client.js')
+const clientPath = join(dirname(target), 'client.js')
 const styles = []
 globalThis.document = {
 	getElementById: (id) => styles.find((style) => style.id === id) ?? null,
@@ -306,5 +380,35 @@ try {
 	delete globalThis.document
 }
 
-console.log('[ok] 框架 import 可解析；消息采集、字节裁剪、标题收窄、POST→jobId→轮询路由流程、默认配置校验、client 文案映射全部通过')
-console.log(`     ${target}`)
+// ---- 8) --installed：工作区构建产物 vs profile 安装副本（逐字节）
+if (checkInstalled) {
+	const home = (process.env.DSH_HOME ?? '').trim() !== ''
+		? process.env.DSH_HOME.trim()
+		: join(process.env.USERPROFILE ?? process.env.HOME ?? homedir(), '.dsh')
+	const profilesRoot = join(home, 'profiles')
+	const files = ['lib/index.js', 'lib/client.js', 'package.json', 'cordis.patch.yml']
+	const copies = []
+	try {
+		for (const name of readdirSync(profilesRoot)) {
+			const dir = join(profilesRoot, name, 'node_modules', 'dsh-session-namer')
+			if (existsSync(join(dir, 'lib', 'index.js'))) copies.push({ name, dir })
+		}
+	} catch {
+		// profiles 目录不存在：按"没有安装副本"处理
+	}
+	if (copies.length === 0) {
+		skip('在 ' + profilesRoot + ' 下没有找到 dsh-session-namer 的安装副本')
+	} else {
+		for (const copy of copies) {
+			for (const file of files) {
+				if (!existsSync(join(copy.dir, file))) fail(copy.name + ': 缺少 ' + file)
+				const same = readFileSync(join(here, file)).equals(readFileSync(join(copy.dir, file)))
+				if (!same) fail(copy.name + ': ' + file + ' 与工作区构建产物不一致（安装副本过期）')
+			}
+			console.log('[ok] ' + copy.name + ': ' + files.length + ' 个文件与工作区一致')
+		}
+	}
+}
+
+console.log('[ok] 消息采集、字节裁剪、标题收窄、围栏、POST->jobId->轮询流程、client 文案映射全部通过')
+console.log('     ' + target)
