@@ -171,6 +171,8 @@ if (stripped.length >= '中文'.repeat(40).length) fail('剥星号后仍须按�
 if (DEFAULTS_REF.targetCjkCharacters !== 8 || DEFAULTS_REF.targetWords !== 5) {
 	fail(`默认标题长度应为 5 词 / 8 个 CJK 字，实际 ${JSON.stringify(DEFAULTS_REF)}`)
 }
+// 输出预算不是标题长度：推理型路由会先花 100~160 个 thinking token，160 会被吃光。
+if (DEFAULTS_REF.maxOutputTokens !== 1024) fail('默认 maxOutputTokens 应为 1024，实际 ' + DEFAULTS_REF.maxOutputTokens)
 
 // ---- 6) 异步路由流程：POST 立刻发 jobId -> GET 轮询（用假 ctx，不依赖运行中的服务器）
 let handler = null
@@ -441,6 +443,89 @@ if (captured.config.targetWords !== undefined || captured.config.targetCjkCharac
 }
 if (captured.request.signal === undefined) fail('必须把取消信号传给共享策略')
 if (captured.request.route.provider !== 'tx') fail('应跟随会话当前路由: ' + JSON.stringify(captured.request.route))
+
+// ---- 6d) 失败路径：默认不再兜底到 deepseek-official；错误要带出每次尝试
+const failSession = {
+	id: 'fail',
+	snapshotEvents: () => [userEvent(1, 'hi')],
+	requestHeader: () => ({ config: { provider: 'tx', model: 'm' } }),
+}
+let failHandler = null
+const failRoutes = []
+const failCtx = {
+	connection: { requestRejection: () => undefined },
+	effect: (fn) => {
+		fn()
+		return () => {}
+	},
+	webServer: { register: (route) => { failHandler = route.handler; return () => {} } },
+	sessions: { get: (id) => (id === 'fail' ? failSession : undefined) },
+	sessionTitle: { rename: () => fail('失败路径不应改名') },
+	logger: { info: () => {}, warn: () => {} },
+	llm: {
+		__stubTitleCall: (input) => {
+			failRoutes.push(input.request.route)
+			throw new Error('primary boom')
+		},
+	},
+}
+module.apply(failCtx)
+const failStarted = await requestOn(failHandler, 'POST', ROUTE, JSON.stringify({ sessionId: 'fail' }))
+let failResult = null
+for (let attempt = 0; attempt < 50; attempt += 1) {
+	const polled = await requestOn(failHandler, 'GET', `${ROUTE}?jobId=${encodeURIComponent(failStarted.json.jobId)}`)
+	if (polled.json.status !== 'running') {
+		failResult = polled.json
+		break
+	}
+	await new Promise((resolve) => setTimeout(resolve, 20))
+}
+if (failResult?.status !== 'error') fail('失败路径应进入 error: ' + JSON.stringify(failResult))
+if (!String(failResult.error).includes('session: primary boom')) {
+	fail('错误里应带上会话路由的真实原因: ' + failResult.error)
+}
+if (String(failResult.error).includes('deepseek-official')) {
+	fail('默认不应再尝试 deepseek-official 兜底: ' + failResult.error)
+}
+if (failRoutes.length !== 1) fail('默认只应尝试会话路由一次，实际 ' + failRoutes.length)
+
+// 显式配置兜底时才打第二条路由
+let fbHandler = null
+const fbRoutes = []
+const fbRenames = []
+const fbCtx = {
+	...failCtx,
+	webServer: { register: (route) => { fbHandler = route.handler; return () => {} } },
+	sessionTitle: { rename: (_session, title) => fbRenames.push(title) },
+	llm: {
+		__stubTitleCall: (input) => {
+			const route = input.request.route
+			fbRoutes.push(route.provider)
+			if (route.provider === 'tx') throw new Error('primary down')
+			return { blocks: [{ type: 'text', text: '兜底标题' }], finish: { kind: 'stop' }, model: route }
+		},
+	},
+}
+module.apply(fbCtx, { fallbackProvider: 'fp', fallbackModel: 'fm' })
+const fbStarted = await requestOn(fbHandler, 'POST', ROUTE, JSON.stringify({ sessionId: 'fail' }))
+let fbResult = null
+for (let attempt = 0; attempt < 50; attempt += 1) {
+	const polled = await requestOn(fbHandler, 'GET', `${ROUTE}?jobId=${encodeURIComponent(fbStarted.json.jobId)}`)
+	if (polled.json.status !== 'running') {
+		fbResult = polled.json
+		break
+	}
+	await new Promise((resolve) => setTimeout(resolve, 20))
+}
+if (fbResult?.status !== 'done' || fbResult.title !== '兜底标题') {
+	fail('显式兜底没有拿到标题: ' + JSON.stringify(fbResult))
+}
+if (fbRoutes.join(',') !== 'tx,fp') {
+	fail('显式兜底应依次尝试会话路由与兜底路由，实际 ' + fbRoutes.join(','))
+}
+if (fbRenames.length !== 1 || fbRenames[0] !== '兜底标题') {
+	fail('显式兜底改名不符: ' + JSON.stringify(fbRenames))
+}
 
 // ---- 7) client half：错误文案映射与顶栏宽度上限（假 DOM + 假 react）
 const clientPath = join(dirname(target), 'client.js')

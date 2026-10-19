@@ -40,11 +40,19 @@ DSH Web 插件：会话标题右侧加一个「总结命名」按钮 —— 用*
     targetWords: 8            # 非 CJK 目标词数
     targetCjkCharacters: 16   # CJK 目标字数
     maxInputBytes: 60000      # 送进模型的输入上限
-    maxOutputTokens: 160
+    maxOutputTokens: 1024     # 输出上限（含推理 token；别调得太小，见下）
     timeoutMs: 30000
     # provider: dy
     # model: deepseek-v4-flash
+    # fallbackProvider: dy      # 可选：会话路由失败时再试一次（两个必须成对给）
+    # fallbackModel: deepseek-v4-flash
 ```
+
+> `maxOutputTokens` 不是标题长度。推理型路由（如 `deepseek-v4.1-flash`）即使把推理档
+> 设成 `off`，也会先吐 100~160 个 thinking token；预算给 160 时经常被思考全吃光，
+> 返回 `finish=length` 且正文为空，标题就拿不到。标题实际只花 ~150 token，预算给大
+> 只是上限，不增加成本。兜底路由**默认不启用**：没配 `DEEPSEEK_API_KEY` 的机器上，
+> 硬塞一条 `deepseek-official` 只会用"没有 API key"的错误盖掉会话路由的真实错误。
 
 ## 安装 / 卸载
 
@@ -81,6 +89,9 @@ node selftest-session-namer.mjs --installed   # 额外把构建产物与 profile
 
 ## 已知边界
 
+- **小输出预算会吃掉标题**：见配置一节的说明。模型把 `maxOutputTokens` 全花在
+  thinking 上时，官方策略会以 `max-tokens` 结束、正文为空；现在默认 1024，并且
+  失败信息会把每一次尝试（`session: …` / `fallback: …`）都带上，不再只报最后一条。
 - **DSH 版本契约**：DSH 0.2.1 把 `@deepseek-ai/dsh-session-title-llm` 的
   `generateSessionTitleWithLlm()` 换成了 `executeSessionTitleLlm()`（prompt / framing /
   推理档位改由调用方提供），并把 `resolveSessionTitleLlmConfig()` 改成**只接受执行控制字段**
