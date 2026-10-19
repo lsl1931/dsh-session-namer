@@ -111,6 +111,15 @@ if (cjkFitted.length === 0) fail('中文会话裁剪后不应为空')
 if (cjkBytes > budget) fail(`中文消息按字节算仍超预算: ${cjkBytes} > ${budget}（说明还在按码元计）`)
 if (cjkFitted.length >= cjk.length) fail('1000 汉字 × 30 条必须被裁剪，不能整段放行')
 
+// 长会话不能只留"首条 + 最近"：首尾之间必须至少采到一条中段消息。
+const spread = []
+for (let i = 0; i < 60; i += 1) spread.push(big(i, 300))
+const spreadFitted = fitMessages(spread, budget)
+const spreadSeqs = spreadFitted.map((message) => message.seq)
+if (!spreadSeqs.includes(0)) fail('长会话应带上首条')
+if (!spreadSeqs.includes(59)) fail('长会话应带上最后一条')
+if (!spreadSeqs.some((seq) => seq > 0 && seq < 59)) fail('长会话应至少采样一条中段消息: ' + spreadSeqs.join(','))
+
 // ---- 4) 默认配置过官方校验（仅当本进程能解析到官方包时才跑）
 if (ROUTE !== '/dsh-session-namer/name') fail('路由不符: ' + ROUTE)
 let officialEntry = null
@@ -150,9 +159,11 @@ if (officialEntry === null) {
 // ---- 5) 标题收窄（显示宽度：CJK 记 2）
 const { shortTitle, TITLE_MAX_WIDTH, DEFAULTS: DEFAULTS_REF } = module.__test
 if (shortTitle === undefined) fail('缺少 shortTitle 导出')
-const truncated = shortTitle('DSH模型推理强度获取与置顶会话')
+const truncated = shortTitle('DSH模型推理强度获取与置顶会话', 28)
 if (truncated !== 'DSH模型推理强度获取与置顶会') fail(`短标题截断不符: ${JSON.stringify(truncated)}`)
 if (shortTitle('a'.repeat(40)) !== 'a'.repeat(TITLE_MAX_WIDTH)) fail('纯 ASCII 标题应按宽度截断')
+if (shortTitle('a'.repeat(40), 20) !== 'a'.repeat(20)) fail('显式宽度参数未生效')
+if (TITLE_MAX_WIDTH !== 36) fail('默认显示宽度应为 36，实际 ' + TITLE_MAX_WIDTH)
 if (shortTitle('  ') !== '') fail('纯空白应当收敛为空串')
 if (shortTitle(' \n a \n\n b ') !== 'a b') fail('空白应折叠')
 if (shortTitle('置顶会话') !== '置顶会话') fail('够短的标题不应被改动')
@@ -168,9 +179,10 @@ if (shortTitle('正常标题') !== '正常标题') fail('普通标题不应被�
 const stripped = shortTitle('**' + '中文'.repeat(40) + '**')
 if (stripped.includes('*')) fail('剥星号后不该残留星号')
 if (stripped.length >= '中文'.repeat(40).length) fail('剥星号后仍须按宽度截断')
-if (DEFAULTS_REF.targetCjkCharacters !== 8 || DEFAULTS_REF.targetWords !== 5) {
-	fail(`默认标题长度应为 5 词 / 8 个 CJK 字，实际 ${JSON.stringify(DEFAULTS_REF)}`)
+if (DEFAULTS_REF.targetCjkCharacters !== 12 || DEFAULTS_REF.targetWords !== 8) {
+	fail(`默认标题长度应为 8 词 / 12 个 CJK 字，实际 ${JSON.stringify(DEFAULTS_REF)}`)
 }
+if (DEFAULTS_REF.maxTitleWidth !== 36) fail('默认 maxTitleWidth 应为 36，实际 ' + DEFAULTS_REF.maxTitleWidth)
 // 输出预算不是标题长度：推理型路由会先花 100~160 个 thinking token，160 会被吃光。
 if (DEFAULTS_REF.maxOutputTokens !== 1024) fail('默认 maxOutputTokens 应为 1024，实际 ' + DEFAULTS_REF.maxOutputTokens)
 
@@ -339,18 +351,34 @@ for (const finish of ['tool-calls', 'max-tokens']) {
 	}
 	if (!threw) fail(`finish=${finish} 时应当抛错`)
 }
-const promptText = systemPrompt({ targetWords: 5, targetCjkCharacters: 8 })
-if (!promptText.includes('5 words') || !promptText.includes('8 CJK characters')) {
+const promptText = systemPrompt({ targetWords: 8, targetCjkCharacters: 12 }, false)
+if (!promptText.includes('8 words') || !promptText.includes('12 CJK characters')) {
 	fail('系统提示词没有带上标题长度目标')
 }
-if (!frameMessages([{ seq: 1, text: 'hi' }]).includes('"seq":1')) fail('输入 framing 应把消息框成 JSON')
+if (promptText.includes('exactly unchanged')) fail('没有当前标题时不应带稳定性规则')
+const anchoredPrompt = systemPrompt({ targetWords: 8, targetCjkCharacters: 12 }, true)
+if (!anchoredPrompt.includes('exactly unchanged')) fail('有当前标题时应带稳定性规则')
+const framed = frameMessages({ humanMessages: [{ seq: 1, text: 'hi' }] })
+if (!framed.includes('JSON object') || !framed.includes('"seq":1')) fail('输入 framing 应把载荷框成 JSON 对象')
 
 let modernHandler = null
 const modernRenames = []
 let captured = null
+const assistantEvent = (seq, text) => ({
+	seq,
+	type: 'assistant/message',
+	data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'text', text }] } },
+})
+const toolEvent = (seq, name) => ({ seq, type: 'tool/call', data: { name, arguments: '{}' } })
 const modernSession = {
 	id: 'modern',
-	snapshotEvents: () => [userEvent(1, '第一段需求'), userEvent(2, '补充要求')],
+	snapshotEvents: () => [
+		userEvent(1, '第一段需求'),
+		userEvent(2, '补充要求'),
+		toolEvent(3, 'bash'),
+		assistantEvent(4, '已经完成插件兼容性修复'),
+		toolEvent(5, 'read'),
+	],
 	requestHeader: () => ({ config: { provider: 'tx', model: 'deepseek-v4.1-flash' } }),
 	append: () => {},
 }
@@ -362,7 +390,10 @@ const modernCtx = {
 	},
 	webServer: { register: (route) => { modernHandler = route.handler; return () => {} } },
 	sessions: { get: (id) => (id === 'modern' ? modernSession : undefined) },
-	sessionTitle: { rename: (_session, title) => modernRenames.push(title) },
+	sessionTitle: {
+		get: () => ({ title: '旧标题', source: { kind: 'provider' } }),
+		rename: (_session, title) => modernRenames.push(title),
+	},
 	logger: { info: () => {}, warn: () => {} },
 	llm: {
 		__stubTitleCall: (input) => {
@@ -434,7 +465,18 @@ if (captured.titleProvider !== 'dsh-session-namer') fail('titleProvider 身份�
 if (!Array.isArray(captured.prepared.messageSeqs) || captured.prepared.messageSeqs.join(',') !== '1,2') {
 	fail('messageSeqs 应来自选中的消息: ' + JSON.stringify(captured.prepared.messageSeqs))
 }
-if (!captured.prepared.input.includes('第一段需求')) fail('送进模型的输入没有包含消息文本')
+const payload = JSON.parse(captured.prepared.input.slice(captured.prepared.input.indexOf('\n') + 1))
+if (payload.currentTitle !== '旧标题') fail('载荷应带上当前标题作为稳定性锚点: ' + JSON.stringify(payload.currentTitle))
+if (!Array.isArray(payload.humanMessages) || payload.humanMessages.length !== 2) {
+	fail('载荷应带上选中的用户消息: ' + JSON.stringify(payload.humanMessages))
+}
+if (payload.lastAssistantReply !== '已经完成插件兼容性修复') {
+	fail('载荷应带上最后一条助手回复: ' + JSON.stringify(payload.lastAssistantReply))
+}
+if (JSON.stringify(payload.toolsUsed) !== JSON.stringify(['bash', 'read'])) {
+	fail('载荷应带上工具名: ' + JSON.stringify(payload.toolsUsed))
+}
+if (!captured.prepared.system.includes('exactly unchanged')) fail('有锚点时系统提示词应包含稳定性规则')
 if (captured.prepared.selectReasoningEffort({ reasoning: { efforts: [{ id: 'off' }] } }) !== 'off') {
 	fail('推理档位应取模型支持的最低档')
 }

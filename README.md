@@ -16,17 +16,22 @@ DSH Web 插件：会话标题右侧加一个「总结命名」按钮 —— 用*
     本地页面都能改名一个活会话。
   - 为什么分两步：总结要 1~5 秒，一次 POST 等到结果的话，响应会在回程被中间层切断
     （客户端报 `Response incomplete: length`）。分成"立刻返回 + 轮询"就没有这个窗口了。
-  - 总结内容：读该会话的人类消息（规则与 `dsh-session-title` 一致），在字节预算内选取要送进模型的
-    子集（从最近往前收，首条能塞下就带上），调用官方共享策略 `generateSessionTitleWithLlm()`
-    （prompt / framing / token 与超时上限都来自 `@deepseek-ai/dsh-session-title-llm`），
-    再用 `ctx.sessionTitle.rename()` 落标题。
+  - 总结内容：读该会话的人类消息（规则与 `dsh-session-title` 一致），在字节预算内选取子集：
+    **首条（交代意图）+ 最近若干条 + 中段等距采样最多 3 条**（只留首尾会让长会话的主题演化全丢），
+    另外带上**当前标题**（作为稳定性锚点）、**最后一条助手回复**和**会话里用过的工具名**
+    ——后两者让标题反映"最后做成了什么"，而不只是"问了什么"。
+    然后调用官方共享策略：DSH 0.2.1+ 用 `executeSessionTitleLlm()`（prompt / framing / 推理档位由
+    本插件提供），旧版 DSH 用 `generateSessionTitleWithLlm()`；最后用 `ctx.sessionTitle.rename()` 落标题。
+  - **稳定性**：有当前标题时，提示词会要求"仍准确就原样返回"，只有主题实质变化才换名。
+    所以反复点不会因为最近一句"继续"就把标题改掉；当前标题来自 fallback（截断的首条提问）时
+    不作为锚点。
   - 输入预算按 **UTF-8 字节**算（官方 `maxInputBytes` 用 `Buffer.byteLength` 校验）。**不能用
     `String.length`**——那数的是 UTF-16 码元，一个汉字 3 字节却只算 1，中文密集的会话会被
     放行到 3 倍上限，然后在官方策略里抛 `input is N bytes, exceeding maxInputBytes`。
     单条消息自己就超预算时按字节截断（保留开头），不整段失败。
-  - 标题长度：模型目标 **5 词 / 8 个汉字**，另有一道硬上限 **28 显示宽度**（≈14 个汉字或 28 个
-    ASCII 字符），超出按宽度截断。按钮上的状态文案另有 `max-width:15em` + 省略号，
-    免得错误信息把顶栏撑变形。
+  - 标题长度：模型目标 **8 词 / 12 个汉字**，另有一道硬上限 **36 显示宽度**（≈18 个汉字或
+    36 个 ASCII 字符，可用 `maxTitleWidth` 覆盖），超出按宽度截断。按钮上的状态文案另有
+    `max-width:15em` + 省略号，免得错误信息把顶栏撑变形。
 - 模型路由：默认 `session.requestHeader().config`，即**该会话当前用的 provider/model**；
   也可以在插件配置里写死 `provider` + `model`（两个必须同时给）。
 
@@ -37,8 +42,9 @@ DSH Web 插件：会话标题右侧加一个「总结命名」按钮 —— 用*
 ```yaml
 - id: dsh-session-namer
   config:
-    targetWords: 8            # 非 CJK 目标词数
-    targetCjkCharacters: 16   # CJK 目标字数
+    targetWords: 8            # 非 CJK 目标词数（默认 8）
+    targetCjkCharacters: 12   # CJK 目标字数（默认 12）
+    maxTitleWidth: 36         # 标题显示宽度硬上限（默认 36）
     maxInputBytes: 60000      # 送进模型的输入上限
     maxOutputTokens: 1024     # 输出上限（含推理 token；别调得太小，见下）
     timeoutMs: 30000
@@ -100,6 +106,9 @@ node selftest-session-namer.mjs --installed   # 额外把构建产物与 profile
   新版自己拼 system / JSON framing / 推理档位，旧版继续走 `generateSessionTitleWithLlm()`。
   如果宿主半在 ESM link 阶段失败（例如新版本删了一个导出），Loader 不会创建 fiber，
   client half 也就不会进 boot graph —— 表现是插件页组件显示「未运行」、顶栏按钮消失。
+- **助手侧信息是有界的**：标题输入里只带**最后一条**助手回复（最多 1.5KB）和最多 8 个工具名，
+  更早的助手内容不参与；中段采样最多 3 条、每条最多 2KB。这是为了在 60KB 预算内同时保留
+  "开场意图、演进过程、最后结果"，不是完整摘要。
 - **纯图片提问的会话拿不到标题**：人类消息的判定要求 `source.kind === "user"` 且**文本块非空**
   （与官方 `dsh-session-title` 同规则），所以只贴了图、没打字的消息不算数，按钮返回
   `409 { code: "no-human-message", error: "无文字可总结" }`，客户端映射成短中文。
