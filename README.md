@@ -74,11 +74,21 @@ node selftest-session-namer.mjs --installed   # 额外把构建产物与 profile
 
 `lib/index.js` 顶层 import 的 `@deepseek-ai/dsh-session-title-llm` 由宿主的 Loader 在运行时
 解析，普通 node 进程解析不到，所以自检用 `selftest/stub-framework.mjs` 挂了一个解析桩——
-桩只在自检里生效，不进入运行时。官方配置校验（`resolveSessionTitleLlmConfig`）在解析不到
-官方包时会 SKIP 而不是失败。
+桩只在自检里生效，不进入运行时。桩**镜像 DSH 0.2.1 的真实契约**（严格的
+`resolveSessionTitleLlmConfig` + `executeSessionTitleLlm`），所以插件要是退回旧 API 写法，
+自检会立刻失败。官方配置校验（`resolveSessionTitleLlmConfig`）在解析不到官方包时会 SKIP
+而不是失败。
 
 ## 已知边界
 
+- **DSH 版本契约**：DSH 0.2.1 把 `@deepseek-ai/dsh-session-title-llm` 的
+  `generateSessionTitleWithLlm()` 换成了 `executeSessionTitleLlm()`（prompt / framing /
+  推理档位改由调用方提供），并把 `resolveSessionTitleLlmConfig()` 改成**只接受执行控制字段**
+  （`maxInputBytes` / `maxOutputTokens` / `timeoutMs` / `provider` / `model`；再传
+  `targetWords` 会抛 `unknown config key`）。插件用命名空间导入 + 运行时分支同时适配两代：
+  新版自己拼 system / JSON framing / 推理档位，旧版继续走 `generateSessionTitleWithLlm()`。
+  如果宿主半在 ESM link 阶段失败（例如新版本删了一个导出），Loader 不会创建 fiber，
+  client half 也就不会进 boot graph —— 表现是插件页组件显示「未运行」、顶栏按钮消失。
 - **纯图片提问的会话拿不到标题**：人类消息的判定要求 `source.kind === "user"` 且**文本块非空**
   （与官方 `dsh-session-title` 同规则），所以只贴了图、没打字的消息不算数，按钮返回
   `409 { code: "no-human-message", error: "无文字可总结" }`，客户端映射成短中文。

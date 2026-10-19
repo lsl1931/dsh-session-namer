@@ -126,14 +126,21 @@ if (officialEntry === null) {
 	skip('本进程解析不到 @deepseek-ai/dsh-session-title-llm（由宿主在运行时解析），跳过官方配置校验')
 } else {
 	const { resolveSessionTitleLlmConfig } = await import(pathToFileURL(officialEntry).href)
+	// 0.2.1 的执行控制只认 maxInputBytes / maxOutputTokens / timeoutMs / provider / model；
+	// 标题长度目标属于提示词参数，不能再塞进这里（会抛 unknown config key）。
+	const controls = {
+		maxInputBytes: DEFAULTS.maxInputBytes,
+		maxOutputTokens: DEFAULTS.maxOutputTokens,
+		timeoutMs: DEFAULTS.timeoutMs,
+	}
 	try {
-		resolveSessionTitleLlmConfig({ ...DEFAULTS })
+		resolveSessionTitleLlmConfig(controls)
 	} catch (error) {
-		fail('默认配置没通过官方校验: ' + String(error?.message ?? error))
+		fail('默认执行控制没通过官方校验: ' + String(error?.message ?? error))
 	}
 	let paired = false
 	try {
-		resolveSessionTitleLlmConfig({ ...DEFAULTS, provider: 'dy' })
+		resolveSessionTitleLlmConfig({ ...controls, provider: 'dy' })
 	} catch {
 		paired = true
 	}
@@ -314,12 +321,133 @@ if (fencedGet.body !== undefined) fail('围栏拒绝时不应带响应体')
 const fencedPost = await callFenced('POST', ROUTE, JSON.stringify({ sessionId: 'live' }))
 if (fencedPost.status !== 401) fail('POST 未过围栏时应返回 401，实际 ' + fencedPost.status)
 if (fenceCalls < 2) fail('GET 与 POST 都必须经过围栏，实际调用 ' + fenceCalls + ' 次')
+
+// ---- 6c) DSH >= 0.2.1 的共享策略：executeSessionTitleLlm 全流程
+const { titleFromResponse, frameMessages, systemPrompt, MODERN_TITLE_LLM } = module.__test
+if (MODERN_TITLE_LLM !== true) fail('桩导出 executeSessionTitleLlm 时应识别为新版共享策略')
+if (titleFromResponse({ blocks: [{ type: 'text', text: '**新标题**\n第二行解释' }], finish: { kind: 'stop' } }) !== '**新标题**') {
+	fail('新版响应应取第一条非空行')
+}
+for (const finish of ['tool-calls', 'max-tokens']) {
+	let threw = false
+	try {
+		titleFromResponse({ blocks: [], finish: { kind: finish } })
+	} catch {
+		threw = true
+	}
+	if (!threw) fail(`finish=${finish} 时应当抛错`)
+}
+const promptText = systemPrompt({ targetWords: 5, targetCjkCharacters: 8 })
+if (!promptText.includes('5 words') || !promptText.includes('8 CJK characters')) {
+	fail('系统提示词没有带上标题长度目标')
+}
+if (!frameMessages([{ seq: 1, text: 'hi' }]).includes('"seq":1')) fail('输入 framing 应把消息框成 JSON')
+
+let modernHandler = null
+const modernRenames = []
+let captured = null
+const modernSession = {
+	id: 'modern',
+	snapshotEvents: () => [userEvent(1, '第一段需求'), userEvent(2, '补充要求')],
+	requestHeader: () => ({ config: { provider: 'tx', model: 'deepseek-v4.1-flash' } }),
+	append: () => {},
+}
+const modernCtx = {
+	connection: { requestRejection: () => undefined },
+	effect: (fn) => {
+		fn()
+		return () => {}
+	},
+	webServer: { register: (route) => { modernHandler = route.handler; return () => {} } },
+	sessions: { get: (id) => (id === 'modern' ? modernSession : undefined) },
+	sessionTitle: { rename: (_session, title) => modernRenames.push(title) },
+	logger: { info: () => {}, warn: () => {} },
+	llm: {
+		__stubTitleCall: (input) => {
+			captured = input
+			return {
+				blocks: [
+					{ type: 'text', text: '**新版标题**' },
+					{ type: 'text', text: '第二行解释' },
+				],
+				finish: { kind: 'stop' },
+				model: input.request.route,
+			}
+		},
+	},
+}
+module.apply(modernCtx)
+if (modernHandler === null) fail('新版路径 apply 没有注册路由')
+
+const requestOn = (targetHandler, method, url, body) =>
+	new Promise((resolve, reject) => {
+		const req = {
+			method,
+			url,
+			on(event, callback) {
+				if (event === 'data' && body !== undefined) callback(Buffer.from(body))
+				if (event === 'end') callback()
+				return req
+			},
+			destroy() {},
+		}
+		const res = {
+			writeHead(status) {
+				this.statusCode = status
+				return this
+			},
+			end(chunk) {
+				const text = chunk ?? ''
+				try {
+					resolve({ status: this.statusCode, json: JSON.parse(text) })
+				} catch {
+					reject(new Error('新版路径响应不是 JSON: ' + text))
+				}
+			},
+		}
+		Promise.resolve(targetHandler(req, res)).catch(reject)
+	})
+
+const startedModern = await requestOn(modernHandler, 'POST', ROUTE, JSON.stringify({ sessionId: 'modern' }))
+if (startedModern.status !== 202 || typeof startedModern.json.jobId !== 'string') {
+	fail('新版路径 POST 应立刻返回 202 + jobId，实际 ' + JSON.stringify(startedModern))
+}
+let done = null
+for (let attempt = 0; attempt < 50; attempt += 1) {
+	const polledModern = await requestOn(modernHandler, 'GET', `${ROUTE}?jobId=${encodeURIComponent(startedModern.json.jobId)}`)
+	if (polledModern.json.status === 'done' || polledModern.json.status === 'error') {
+		done = polledModern.json
+		break
+	}
+	await new Promise((resolve) => setTimeout(resolve, 20))
+}
+if (done === null) fail('新版路径轮询超时')
+if (done.status !== 'done') fail('新版路径没有成功改名: ' + JSON.stringify(done))
+if (done.title !== '新版标题') fail('标题收窄结果不符: ' + JSON.stringify(done))
+if (modernRenames.length !== 1 || modernRenames[0] !== '新版标题') {
+	fail('新版路径应调用 sessionTitle.rename 一次且标题正确，实际 ' + JSON.stringify(modernRenames))
+}
+if (captured === null) fail('新版共享策略没有被调用')
+if (captured.titleProvider !== 'dsh-session-namer') fail('titleProvider 身份不符: ' + captured.titleProvider)
+if (!Array.isArray(captured.prepared.messageSeqs) || captured.prepared.messageSeqs.join(',') !== '1,2') {
+	fail('messageSeqs 应来自选中的消息: ' + JSON.stringify(captured.prepared.messageSeqs))
+}
+if (!captured.prepared.input.includes('第一段需求')) fail('送进模型的输入没有包含消息文本')
+if (captured.prepared.selectReasoningEffort({ reasoning: { efforts: [{ id: 'off' }] } }) !== 'off') {
+	fail('推理档位应取模型支持的最低档')
+}
+if (captured.config.targetWords !== undefined || captured.config.targetCjkCharacters !== undefined) {
+	fail('执行控制里不应混入标题长度目标（0.2.1 会抛 unknown config key）')
+}
+if (captured.request.signal === undefined) fail('必须把取消信号传给共享策略')
+if (captured.request.route.provider !== 'tx') fail('应跟随会话当前路由: ' + JSON.stringify(captured.request.route))
+
 // ---- 7) client half：错误文案映射与顶栏宽度上限（假 DOM + 假 react）
 const clientPath = join(dirname(target), 'client.js')
 const styles = []
 globalThis.document = {
 	getElementById: (id) => styles.find((style) => style.id === id) ?? null,
-	createElement: () => ({ id: '', textContent: '' }),
+	createElement: () => ({ id: '', textContent: '', dataset: {} }),
 	head: { appendChild: (tag) => { styles.push(tag) } },
 }
 const cells = []
@@ -410,5 +538,5 @@ if (checkInstalled) {
 	}
 }
 
-console.log('[ok] 消息采集、字节裁剪、标题收窄、围栏、POST->jobId->轮询流程、client 文案映射全部通过')
+console.log('[ok] 消息采集、字节裁剪、标题收窄、围栏、POST->jobId->轮询流程、新版共享策略、client 文案映射全部通过')
 console.log('     ' + target)

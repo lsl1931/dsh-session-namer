@@ -12,7 +12,16 @@
 // 总结本身复用官方策略 @deepseek-ai/dsh-session-title-llm：prompt、输入 framing、
 // 字节/输出 token 上限、超时、以及"跟随该会话当前模型路由"都由它决定。
 import { randomUUID } from 'node:crypto'
-import { generateSessionTitleWithLlm, resolveSessionTitleLlmConfig } from '@deepseek-ai/dsh-session-title-llm'
+// DSH 0.2.1 把共享策略从 generateSessionTitleWithLlm() 换成了 executeSessionTitleLlm()，
+// 旧导出被删除。静态具名导入会让整个宿主半在 ESM link 阶段就抛
+// "does not provide an export named 'generateSessionTitleWithLlm'"：Loader 因此不创建
+// fiber，client half 也不会被组装进 boot graph —— 表现就是插件页「未运行」、按钮消失。
+// 这里用命名空间导入 + 运行时分支：新版走新 API，旧版 DSH 仍能走旧 API。
+import * as titleLlm from '@deepseek-ai/dsh-session-title-llm'
+
+const { resolveSessionTitleLlmConfig } = titleLlm
+/** DSH >= 0.2.1 的共享策略：prompt / framing / 推理档位由调用方提供。 */
+const MODERN_TITLE_LLM = typeof titleLlm.executeSessionTitleLlm === 'function'
 
 const name = 'dsh-session-namer'
 const ROUTE = '/dsh-session-namer/name'
@@ -70,6 +79,45 @@ function shortTitle(raw) {
     kept += char
   }
   return kept === '' ? text.slice(0, TITLE_MAX_WIDTH) : kept
+}
+
+/**
+ * 新版共享策略的系统提示词（与官方 title provider 同款措辞）。
+ * @param tuning - 标题长度目标。
+ * @returns 系统指令。
+ */
+function systemPrompt(tuning) {
+  return [
+    'Create a concise title for an AI coding-assistant session from the supplied human messages.',
+    'Return only the title on one line, **in plain text of natural language**, with no quotes, prefix, explanation, Markdown, XML, or terminal control codes. No code is allowed.',
+    'Use the language of the messages.',
+    `Aim for about ${tuning.targetWords} words in non-CJK languages or ${tuning.targetCjkCharacters} CJK characters.`,
+    'If the messages give little to name, still return a short best-effort title, such as Greeting, instead of explaining.',
+  ].join('\n')
+}
+
+/**
+ * 把选中的消息框成 JSON：用户文本无法破坏结构分隔符（官方同款 framing）。
+ * @param messages - {seq, text} 数组。
+ * @returns 送进模型的用户输入。
+ */
+function frameMessages(messages) {
+  return `Generate the session title from this JSON array of human messages:\n${JSON.stringify(messages)}`
+}
+
+/**
+ * 新版响应 -> 标题行：官方 provider 的规则是取第一条非空行（模型常把标题放第一行，
+ * 后面跟着解释）。Markdown 记号由 shortTitle 统一剥掉。
+ * @param response - executeSessionTitleLlm() 的结果。
+ * @returns 标题行，可能为空串。
+ */
+function titleFromResponse(response) {
+  const finish = response?.finish?.kind
+  if (finish === 'tool-calls') throw new Error('session-title-llm: title output must contain text only')
+  if (finish === 'max-tokens') throw new Error('session-title-llm: title output reached maxOutputTokens')
+  const blocks = Array.isArray(response?.blocks) ? response.blocks : []
+  const text = blocks.filter((block) => block.type === 'text').map((block) => block.text).join('\n')
+  return text.split(/\r?\n/u).map((line) => line.trim()).find((line) => line.length > 0) ?? ''
 }
 
 /**
@@ -193,13 +241,64 @@ function respond(res, status, payload) {
 }
 
 /**
+ * DSH >= 0.2.1：调用共享策略的新入口，自己提供 system / framing / 推理档位。
+ * @param ctx - 暴露 llm 的上下文。
+ * @param resolved - 已校验的执行控制（maxInputBytes / maxOutputTokens / timeoutMs / 可选路由）。
+ * @param tuning - 标题长度目标（只影响提示词）。
+ * @param session - 目标会话。
+ * @param route - 本次尝试的路由，undefined 表示用 resolved 里写死的 provider/model。
+ * @param selected - 送进模型的 {seq, text} 子集。
+ * @param signal - 取消信号。
+ * @returns 收窄后的标题。
+ */
+async function modernTitle(ctx, resolved, tuning, session, route, selected, signal) {
+  const response = await titleLlm.executeSessionTitleLlm(
+    ctx,
+    resolved,
+    { session, ...(route === undefined ? {} : { route }), signal },
+    name,
+    {
+      system: systemPrompt(tuning),
+      input: frameMessages(selected),
+      messageSeqs: selected.map((message) => message.seq),
+      // 官方 provider 的选择：标题任务用模型支持的最低推理档。
+      selectReasoningEffort: (model) => model.reasoning?.efforts[0]?.id,
+    },
+  )
+  return shortTitle(titleFromResponse(response))
+}
+
+/**
+ * 旧版 DSH（< 0.2.1）：沿用 generateSessionTitleWithLlm()，prompt 与 framing 由它负责。
+ * @param ctx - 暴露 llm 的上下文。
+ * @param resolved - 旧版策略配置（含 targetWords / targetCjkCharacters）。
+ * @param session - 目标会话。
+ * @param route - 本次尝试的路由。
+ * @param messages - 全部人类消息（旧 API 的 request.messages）。
+ * @param selected - 送进模型的字节预算内子集。
+ * @param signal - 取消信号。
+ * @returns 收窄后的标题。
+ */
+async function legacyTitle(ctx, resolved, session, route, messages, selected, signal) {
+  const result = await titleLlm.generateSessionTitleWithLlm(
+    ctx,
+    resolved,
+    { session, messages, ...(route === undefined ? {} : { route }), signal },
+    selected,
+    name,
+  )
+  return shortTitle(result.title)
+}
+
+/**
  * 后台跑一次总结并改名，结果写进 job。
  * @param ctx - 暴露 llm / sessionTitle 的上下文。
- * @param resolved - 已校验的官方策略配置。
+ * @param policy - { resolved, tuning }：已校验的官方策略配置 + 标题长度目标。
  * @param session - 目标会话（调用方已确认活着且有内容）。
  * @param job - 结果槽 {status, title?, error?}。
  */
-async function summarize(ctx, resolved, session, job, fallback) {
+async function summarize(ctx, policy, session, job, fallback) {
+  const { resolved, tuning } = policy
   const controller = new AbortController()
   const safety = setTimeout(
     () => controller.abort(new Error('summarize timed out')),
@@ -222,14 +321,9 @@ async function summarize(ctx, resolved, session, job, fallback) {
     let lastError = new Error('no attempt ran')
     for (const attempt of attempts) {
       try {
-        const result = await generateSessionTitleWithLlm(
-          ctx,
-          resolved,
-          { session, messages, ...(attempt.route === undefined ? {} : { route: attempt.route }), signal: controller.signal },
-          selected,
-          name,
-        )
-        const title = shortTitle(result.title)
+        const title = MODERN_TITLE_LLM
+          ? await modernTitle(ctx, resolved, tuning, session, attempt.route, selected, controller.signal)
+          : await legacyTitle(ctx, resolved, session, attempt.route, messages, selected, controller.signal)
         ctx.sessionTitle.rename(session, title)
         job.status = 'done'
         job.title = title
@@ -257,15 +351,23 @@ async function summarize(ctx, resolved, session, job, fallback) {
  * @param config - 可选的模型与预算覆盖；不给 provider/model 就跟随会话当前路由。
  */
 function apply(ctx, config) {
-  const resolved = resolveSessionTitleLlmConfig({
+  // 标题长度目标是本插件的提示词参数；0.2.1 的 resolveSessionTitleLlmConfig 只接受
+  // 执行控制字段（maxInputBytes / maxOutputTokens / timeoutMs / provider / model），
+  // 多传一个 key 就会抛 "unknown config key"。旧版则把两项也放在同一个对象里。
+  const tuning = {
     targetWords: config?.targetWords ?? DEFAULTS.targetWords,
     targetCjkCharacters: config?.targetCjkCharacters ?? DEFAULTS.targetCjkCharacters,
+  }
+  const controls = {
     maxInputBytes: config?.maxInputBytes ?? DEFAULTS.maxInputBytes,
     maxOutputTokens: config?.maxOutputTokens ?? DEFAULTS.maxOutputTokens,
     timeoutMs: config?.timeoutMs ?? DEFAULTS.timeoutMs,
     ...(config?.provider === undefined ? {} : { provider: config.provider }),
     ...(config?.model === undefined ? {} : { model: config.model }),
-  })
+  }
+  const resolved = MODERN_TITLE_LLM
+    ? resolveSessionTitleLlmConfig(controls)
+    : resolveSessionTitleLlmConfig({ ...tuning, ...controls })
 
   // 兜底路由：会话路由失败时用于重试（成对给；可用配置覆盖默认的官方路由）。
   const fallback =
@@ -347,7 +449,7 @@ function apply(ctx, config) {
           const job = { status: 'running', createdAt: now, sessionId }
           jobs.set(jobId, job)
           // 不等它：长响应会在回程被切断，所以先把 jobId 交回客户端，由客户端轮询。
-          void summarize(ctx, resolved, session, job, fallback)
+          void summarize(ctx, { resolved, tuning }, session, job, fallback)
           respond(res, 202, { ok: true, jobId })
         },
       }),
@@ -363,6 +465,10 @@ export const __test = {
   fitMessages,
   shortTitle,
   charWidth,
+  systemPrompt,
+  frameMessages,
+  titleFromResponse,
+  MODERN_TITLE_LLM,
   DEFAULTS,
   ROUTE,
   TITLE_MAX_WIDTH,
