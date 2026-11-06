@@ -34,5 +34,17 @@
   "engines": {
     "node": ">=22"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lsl1931/dsh-session-namer.git"
+  },
+  "homepage": "https://github.com/lsl1931/dsh-session-namer#readme",
+  "bugs": {
+    "url": "https://github.com/lsl1931/dsh-session-namer/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  }
 }
